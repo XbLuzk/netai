@@ -219,8 +219,11 @@ graph TB
     U4 --> U6
     U2 --> U7[Unit 7: Query API + SSE]
     U5 --> U7
+    U6 --> U9[Unit 9: Impact API + GitHub Webhook]
+    U7 --> U9
     U6 --> U8[Unit 8: HTTP Server 组装]
     U7 --> U8
+    U9 --> U8
 ```
 
 ---
@@ -590,6 +593,77 @@ graph TB
 **Verification:**
 - `docker-compose up --build` 全流程无报错
 - 对 LogicMap 自身代码库索引并查询"什么函数处理 HTTP 请求"，返回有意义的结果
+
+---
+
+- [ ] **Unit 9: 变更影响分析 API + GitHub Webhook**
+
+**Goal:** 实现 `/impact` 接口（给定函数名，返回精确上下游影响链路）和 GitHub PR webhook（PR 提交时自动分析变更影响并回帖）。这是与 Cursor 的核心差异化：确定性的调用图 + 无需人工触发的自动化。
+
+**Requirements:** 基于 R7（调用图）、R13（Tool Use）的扩展；新增 webhook 集成
+
+**Dependencies:** Unit 6（call graph 已建立）, Unit 7（query service 可复用）
+
+**Files:**
+- Create: `internal/impact/handler.go`
+- Create: `internal/impact/service.go`（图遍历 + LLM 描述生成）
+- Create: `internal/impact/store.go`（递归 caller 查询）
+- Create: `internal/webhook/github.go`（GitHub webhook handler）
+- Create: `sqlc/queries/impact.sql`
+- Test: `internal/impact/service_test.go`
+- Test: `internal/webhook/github_test.go`
+
+**Approach:**
+
+`POST /impact`：
+```json
+{
+  "repo_id": "...",
+  "functions": ["processOrder", "validateInput"],
+  "depth": 3
+}
+```
+响应：
+```json
+{
+  "changed_functions": [...],
+  "affected_callers": [
+    {"function": "handleCheckout", "file": "...", "depth": 1},
+    {"function": "TestHandleCheckout", "file": "...", "depth": 2}
+  ],
+  "summary": "修改 processOrder 将影响 5 个调用者，横跨 3 个文件...",
+  "affected_files": ["handler.go", "service.go", "..."]
+}
+```
+
+- `impact.store.go`：递归查询 `call_edges`，最多 `depth` 层（默认 3），用 `WITH RECURSIVE` CTE 或多次 `get_callers` 查询实现；返回 `{function_id, name, file_path, depth}` 列表
+- `impact.service.go`：聚合调用者列表 → 调用 LLM 生成 summary（不走 agentic loop，直接单次 completion，输入是结构化调用者列表）
+- `GET /impact/config`：返回 webhook 配置说明（供用户参考）
+
+GitHub Webhook（`POST /webhooks/github`）：
+- 验证 `X-Hub-Signature-256`（HMAC-SHA256，secret 来自 `GITHUB_WEBHOOK_SECRET` env）
+- 只处理 `pull_request` 事件的 `opened` / `synchronize` action
+- 从 PR diff（`GET /repos/{owner}/{repo}/pulls/{pull_number}/files`）提取变更文件列表
+- 对每个变更文件，从已索引的 `functions` 表找出该文件包含的函数（`WHERE file_path = $1`）
+- 调用 `impact.service` 得到影响报告
+- 用 GitHub API（`POST /repos/{owner}/{repo}/issues/{issue_number}/comments`）回帖
+- 回帖格式：Markdown 表格，列出受影响函数、文件、调用深度，附 LLM 生成的 summary
+- 配置：`GITHUB_TOKEN`（Personal Access Token，用于发评论）、`GITHUB_WEBHOOK_SECRET`
+
+**Test scenarios:**
+- Happy path: `POST /impact` 给定函数名，返回正确的上游调用者列表（深度 1）
+- Happy path: depth=2 时返回调用者的调用者
+- Edge case: 函数名不存在于索引，返回 `{"affected_callers": [], "summary": "未找到该函数"}`
+- Edge case: 循环调用（A→B→A），递归查询不死循环（visited set 去重）
+- Error path: webhook 签名验证失败，返回 401
+- Happy path: webhook 收到 PR 事件，正确解析变更文件，调用 impact service，构造 Markdown 评论
+- Edge case: PR 变更文件中无已索引函数（新文件或未索引语言），回帖注明"无可分析函数"
+- Integration: 端到端 — 对 LogicMap 自身提 PR，webhook 自动回帖影响分析
+
+**Verification:**
+- `POST /impact` 对已索引仓库返回结构化影响列表，深度正确
+- GitHub webhook 签名验证拒绝伪造请求
+- 本地用 `ngrok` 或 `smee.io` 转发测试 webhook 端到端流程
 
 ## System-Wide Impact
 
